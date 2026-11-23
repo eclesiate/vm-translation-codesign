@@ -1,0 +1,4 @@
+# Task 2.3: proportional reservation (4 of 16 banks ~ PT share of DRAM traffic)
+f23_iso4banks_r1 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_num_banks=4
+f23_iso4banks_r2 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_num_banks=4
+f23_iso4banks_r3 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_num_banks=4

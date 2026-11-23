@@ -1,0 +1,3 @@
+# Own microbenchmark (pchase 8.5 GiB): Task 1.1 with 10K reach snapshots
+pc_t11_4k config/virtuoso_configs/virtuoso_reservethp.cfg 20000000 -g --perf_model/reserve_thp_allocator/target_fragmentation=0.0 -g --core/hook_periodic_ins/ins_global=10000
+pc_t11_2m config/virtuoso_configs/virtuoso_reservethp.cfg 20000000 -g --perf_model/reserve_thp_allocator/target_fragmentation=1.0 -g --core/hook_periodic_ins/ins_global=10000

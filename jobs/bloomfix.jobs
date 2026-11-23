@@ -1,0 +1,7 @@
+# Task 1.3/1.4 rerun with address-tagged (race-free) Bloom hint
+f14_llc_bloom_r1 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru
+f14_comb_r1 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000
+f14_llc_bloom_r2 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru
+f14_comb_r2 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000
+f14_llc_bloom_r3 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru
+f14_comb_r3 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000

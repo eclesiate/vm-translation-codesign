@@ -1,0 +1,6 @@
+# Own microbenchmark: cross-check Task 1.4 / 2.3 (single runs)
+pc_t14_base config/virtuoso_configs/virtuoso_reservethp.cfg 20000000 -g --perf_model/reserve_thp_allocator/target_fragmentation=0.25
+pc_t14_comb config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000
+pc_t14_comb_type config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/nuca/cache/llc_pte/insert_pte=0
+pc_t23_mixed config/virtuoso_configs/virtuoso_pagetable_aware.cfg 20000000
+pc_t23_isolated config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000

@@ -1,0 +1,1822 @@
+--- a/build_virtuoso.sh
++++ b/build_virtuoso.sh
+@@ -2,7 +2,7 @@
+ 
+ 
+ make distclean 
+-make -j
++make -j4  # capped: unbounded -j exhausted RAM on 16GB laptop
+ 
+ if [ $? -ne 0 ]; then
+     echo "Build failed. Please check the output for errors."
+--- a/incremental_compile.sh
++++ b/incremental_compile.sh
+@@ -1,7 +1,7 @@
+ #!/bin/bash
+ 
+ 
+-make -j
++make -j4  # capped: unbounded -j exhausted RAM on 16GB laptop
+ 
+ if [ $? -ne 0 ]; then
+     echo "Build failed. Please check the output for errors."
+--- a/common/core/memory_subsystem/cache/cache_set.cc
++++ b/common/core/memory_subsystem/cache/cache_set.cc
+@@ -182,12 +182,12 @@
+       case CacheBase::TLB_TEMPLATE:
+          //@kanellok CompArch 2025 Lab 6
+          // Wire this policy into TLB configs (cfg name: tlb_template).
+-         return new CacheSetTLBTemplate(cache_type, associativity, blocksize, is_tlb_set);
++         return new CacheSetTLBTemplate(cfgname, core_id, cache_type, associativity, blocksize, is_tlb_set);
+ 
+       case CacheBase::LLC_TEMPLATE:
+          //@kanellok CompArch 2025 Lab 6
+          // Wire and modify this for LLC experiments (cfg name: llc_template).
+-         return new CacheSetLLCTemplate(cache_type, associativity, blocksize, is_tlb_set);
++         return new CacheSetLLCTemplate(cfgname, core_id, cache_type, associativity, blocksize, is_tlb_set);
+ 
+       default:
+          LOG_PRINT_ERROR("Unrecognized Cache Replacement Policy: %i",
+--- a/common/core/memory_subsystem/cache/cache_set_llc_template.cc
++++ b/common/core/memory_subsystem/cache/cache_set_llc_template.cc
+@@ -1,192 +1,199 @@
+ #include "cache_set_llc_template.h"
++#include "pte_priority_hint.h"
++#include "simulator.h"
++#include "config.hpp"
++#include "stats.h"
+ #include "log.h"
+ #include <algorithm>
+ 
+-// @kanellok: CompArch25 - Lab 6
+-// Template policy for LLC sets that adapt to workload behavior
+-// (e.g., translation intensity vs data intensity).
+-// This file intentionally implements a *very simple RRIP-style* policy.
+-// Your job in the lab is to *modify* three conceptual parts:
+-//
+-//   1. Insertion policy:
+-//        - What "age" do we assign to a line when it is brought into the set?
+-//        - How should that age depend on whether the line is a PTE vs data?
+-//        - How should that age depend on whether the program is translation- vs data- intensive?
+-
+-//   2. Victim selection policy:
+-//        - When the set is full, which way do we evict?
+-//        - Can we prefer evicting data over PTEs?
+-//        - Should we prioritize PTEs/PMDs that store large pages? (This piece of info is not available in the baseline.)
+-//        - Should we consider whether the PTE belongs to a translation that is costly to walk?
+-//        - Is the PTE also stored in the L1/L2 TLBs?
+-//
+-//   3. Hit / promotion policy:
+-//        - How does a cache hit change the age of a line?
+-//        - Should PTE hits be promoted more strongly than data hits?
+-//
+-// The "age" field is a small saturating counter per way:
+-//
+-//    age == 0          : very recently used (hard to evict)
+-//    age in (0..max)   : medium
+-//    age == m_max_age  : old (easy to evict)
+-//
+-// With 2 bits, m_max_age = 3 and ages are in [0..3].
+-// This is very similar to SRRIP, but slightly simplified.
++// CompArch 2025 Lab 6, Task 1.3: PTE-aware RRIP for the LLC (see header).
++
++bool CacheSetLLCTemplate::s_stats_registered = false;
++UInt64 CacheSetLLCTemplate::s_fills_pte = 0;
++UInt64 CacheSetLLCTemplate::s_fills_pte_hint = 0;
++UInt64 CacheSetLLCTemplate::s_fills_data = 0;
++UInt64 CacheSetLLCTemplate::s_evict_pte = 0;
++UInt64 CacheSetLLCTemplate::s_evict_data = 0;
++UInt64 CacheSetLLCTemplate::s_hits_pte = 0;
++UInt64 CacheSetLLCTemplate::s_hits_data = 0;
++UInt64 CacheSetLLCTemplate::s_cap_reached = 0;
++
++namespace
++{
++   SInt64 cfgInt(const String &key, core_id_t core_id, SInt64 dflt)
++   {
++      if (Sim()->getCfg()->hasKey(key))
++         return Sim()->getCfg()->getIntArray(key, core_id);
++      return dflt;
++   }
++}
+ 
+ CacheSetLLCTemplate::CacheSetLLCTemplate(
++      String cfgname, core_id_t core_id,
+       CacheBase::cache_t cache_type,
+       UInt32 associativity, UInt32 blocksize, bool is_tlb_set)
+    : CacheSet(cache_type, associativity, blocksize, is_tlb_set)
+-   , m_age(associativity, 2) // Start slightly old so hits have a visible effect.
+-   , m_max_age(3)            // With 2 bits, max age is 3 (0..3).
+-   , m_insert_age(2)         // Default insertion age (can be tuned).
+-   , m_hand(0)               // "Clock hand" to avoid always starting at way 0.
+-{
+-   // TUNING HINTS for students:
+-   //
+-   //   * m_insert_age = 3   → "long" insertion (like SRRIP): new lines are cold.
+-   //   * m_insert_age = 2   → moderate protection (current default).
+-   //   * m_insert_age = 1/0 → very aggressive protection: new lines look hot.
+-   //
+-   // For Lab 6, you will *not* simply use one global m_insert_age:
+-   // you will choose an insertion age depending on whether this fill
+-   // is for a page-table entry (PTE) or for normal data, and possibly
+-   // based on the recent behavior of the set.
++   , m_hand(0)
++   , m_pending_way(-1)
++   , m_pending_hint(false)
++{
++   const String p = cfgname + "/llc_pte/";
++   const UInt32 bits = cfgInt(p + "bits", core_id, 2);
++   LOG_ASSERT_ERROR(bits >= 1 && bits <= 7, "llc_pte/bits must be in [1,7]");
++   m_max_age = (1 << bits) - 1;
++   auto clampAge = [this](SInt64 v) { return (UInt8)std::max<SInt64>(0, std::min<SInt64>(v, m_max_age)); };
++   m_insert_data = clampAge(cfgInt(p + "insert_data", core_id, m_max_age - 1));
++   m_insert_pte = clampAge(cfgInt(p + "insert_pte", core_id, m_max_age >= 2 ? m_max_age - 2 : 0));
++   m_insert_pte_hint = clampAge(cfgInt(p + "insert_pte_hint", core_id, 0));
++   m_pte_hit_age = clampAge(cfgInt(p + "pte_hit_age", core_id, 0));
++   m_max_pte_ways = std::min<SInt64>(cfgInt(p + "max_pte_ways", core_id, associativity / 2), associativity);
++
++   m_age.assign(m_associativity, m_max_age);
++
++   if (!s_stats_registered)
++   {
++      s_stats_registered = true;
++      registerStatsMetric("llc_pte", 0, "fills_pte", &s_fills_pte);
++      registerStatsMetric("llc_pte", 0, "fills_pte_hint", &s_fills_pte_hint);
++      registerStatsMetric("llc_pte", 0, "fills_data", &s_fills_data);
++      registerStatsMetric("llc_pte", 0, "evictions_pte", &s_evict_pte);
++      registerStatsMetric("llc_pte", 0, "evictions_data", &s_evict_data);
++      registerStatsMetric("llc_pte", 0, "hits_pte", &s_hits_pte);
++      registerStatsMetric("llc_pte", 0, "hits_data", &s_hits_data);
++      registerStatsMetric("llc_pte", 0, "cap_reached", &s_cap_reached);
++      PtePriorityHint::init();
++   }
++}
++
++bool
++CacheSetLLCTemplate::isPTE(UInt32 way) const
++{
++   if (!m_cache_block_info_array[way]->isValid())
++      return false;
++   const CacheBlockInfo::block_type_t t = m_cache_block_info_array[way]->getBlockType();
++   return t == CacheBlockInfo::block_type_t::PAGE_TABLE
++       || t == CacheBlockInfo::block_type_t::PAGE_TABLE_PASSTHROUGH;
++}
++
++UInt32
++CacheSetLLCTemplate::countPTE() const
++{
++   UInt32 n = 0;
++   for (UInt32 i = 0; i < m_associativity; i++)
++      if (isPTE(i))
++         n++;
++   return n;
++}
++
++void
++CacheSetLLCTemplate::resolvePendingInsert()
++{
++   if (m_pending_way < 0)
++      return;
++   const UInt32 w = m_pending_way;
++   m_pending_way = -1;
++   if (!m_cache_block_info_array[w]->isValid())
++      return;
++
++   if (!isPTE(w))
++   {
++      m_age[w] = m_insert_data;
++      s_fills_data++;
++      return;
++   }
++   s_fills_pte++;
++   if (m_pending_hint)
++      s_fills_pte_hint++;
++
++   // The new line is already counted in countPTE(); compare against the cap
++   // excluding it.
++   if (countPTE() > m_max_pte_ways)
++   {
++      m_age[w] = m_insert_data;        // over the cap: no protection
++      s_cap_reached++;
++   }
++   else
++      m_age[w] = m_pending_hint ? m_insert_pte_hint : m_insert_pte;
+ }
+ 
+ UInt32
+ CacheSetLLCTemplate::getReplacementIndex(CacheCntlr *cntlr)
+ {
+-   // @kanellok: CompArch25 - Lab 6
+-   // ============================================================
+-   // 1. Decide how to insert the *new* line (insertion policy)
+-   // ============================================================
+-   //
+-   // At the moment, we ignore the access type and always use
+-   // the same insertion age m_insert_age.
+-   //
+-   // For the lab:
+-   //   - Use 'cntlr' to detect whether this miss is caused by
+-   //     a page-table walk or a normal demand access.
+-   //   - Choose an insertion age accordingly, e.g.:
+-   //
+-   //       bool is_translation_fill = ...; // from cntlr
+-   //       UInt8 insert_age =
+-   //           is_translation_fill ? /*younger*/ 1 : /*older*/ 3;
+-   //
+-   //   - You can also make insert_age depend on recent history in this set.
+-   //
+-   UInt8 insert_age = m_insert_age;   // current simple baseline
+-
+-
+-   // @kanellok: CompArch25 - Lab 6
+-   // ============================================================
+-   // 2. Prefer invalid lines first (no eviction if possible)
+-   // ============================================================
+-   //
+-   // This part is usually NOT changed: if a way is invalid,
+-   // we can simply place the new line there.
+-   //
++   resolvePendingInsert();
++   m_pending_hint = PtePriorityHint::insertHint();   // set by NucaCache::write for this exact line
++
+    for (UInt32 i = 0; i < m_associativity; i++)
+    {
+       if (!m_cache_block_info_array[i]->isValid())
+       {
+-         m_age[i] = insert_age;
++         m_pending_way = i;
+          return i;
+       }
+    }
+ 
+-   // @kanellok: CompArch25 - Lab 6
+-   // ============================================================
+-   // 3. Find a victim (RRIP-style) when all ways are valid
+-   // ============================================================
+-   //
+-   // We perform up to (m_max_age + 1) "rounds".
+-   // In each round we look for a way whose age is at m_max_age
+-   // (i.e., considered "old enough" to evict). If we don't find
+-   // such a way in this round, we age all lines and try again.
+-   //
+-   // This guarantees that:
+-   //   - A line must eventually become a valid victim,
+-   //   - But we don't have to linearly scan forever.
+-   //
++   const bool protect = countPTE() < m_max_pte_ways;
++
+    for (UInt32 round = 0; round <= m_max_age; ++round)
+    {
++      SInt32 victim_data = -1, victim_pte = -1;
+       for (UInt32 i = 0; i < m_associativity; i++)
+       {
+-         UInt32 idx = (m_hand + i) % m_associativity;
+-
+-         // Candidate victim: old enough AND allowed by higher-level rules
+-         if (m_age[idx] >= m_max_age && isValidReplacement(idx))
++         const UInt32 idx = (m_hand + i) % m_associativity;
++         if (m_age[idx] < m_max_age || !isValidReplacement(idx))
++            continue;
++         if (isPTE(idx))
+          {
++            if (victim_pte < 0) victim_pte = idx;
++         }
++         else if (victim_data < 0)
++            victim_data = idx;
++      }
+ 
++      // Protected: evict data first. Over the cap: evict PTE lines first so the
++      // set drifts back under max_pte_ways.
++      SInt32 victim;
++      if (protect)
++         victim = victim_data >= 0 ? victim_data : victim_pte;
++      else
++         victim = victim_pte >= 0 ? victim_pte : victim_data;
+ 
+-            // @kanellok: CompArch25 - Lab 6
+-            // ====================================================
+-            //    Lab 6 hook: victim *preference* logic
+-            // ====================================================
+-            //
+-            // At this point, 'idx' is acceptable to evict under the
+-            // plain RRIP policy. But in the lab you will let the
+-            // *type* of line influence this choice:
+-            //
+-            //   - Prefer to evict "data" over "PTE" lines.
+-            //   - Possibly prefer lines from low-priority streams.
+-            //
+-            // Example idea (NOT implemented here):
+-            //
+-            //   if (is_translation_fill && line_at(idx).isPTE())
+-            //       continue;  // try to avoid evicting PTEs first
+-            //
+-            // For now we just accept the first valid victim.
+-
+-            m_hand = (idx + 1) % m_associativity; // Next search starts after victim
+-            m_age[idx] = insert_age;              // New line comes in with insert_age
+-            return idx;
+-         }
++      if (victim >= 0)
++      {
++         if (isPTE(victim)) s_evict_pte++; else s_evict_data++;
++         m_hand = (victim + 1) % m_associativity;
++         m_pending_way = victim;
++         return victim;
+       }
+ 
+-      // --------------------------------------------------------
+-      // 3b. No victim found in this round → age all lines and try again
+-      // --------------------------------------------------------
+-      //
+-      // This step is why the outer 'round' loop will eventually succeed:
+-      // once every line has repeatedly aged, some will hit m_max_age and
+-      // become eligible victims.
+-      
+-      
+       for (UInt32 i = 0; i < m_associativity; i++)
+          m_age[i] = std::min<UInt8>(m_age[i] + 1, m_max_age);
+    }
+ 
+-   // We should never get here.
++   // Every line is at max age after (max+1) rounds, so this is only reached if
++   // isValidReplacement() rejected all of them.
++   for (UInt32 i = 0; i < m_associativity; i++)
++      if (isValidReplacement(i))
++      {
++         m_pending_way = i;
++         return i;
++      }
+    LOG_PRINT_ERROR("LLC template failed to find a victim");
++   return 0;
+ }
+ 
+ void
+ CacheSetLLCTemplate::updateReplacementIndex(UInt32 accessed_index)
+ {
+-   // ============================================================
+-   // 4. Hit / promotion policy
+-   // ============================================================
+-   //
+-   // Every time a line in this set is *accessed* (hit), the cache
+-   // controller calls updateReplacementIndex() with the index.
+-   //
+-   // Here we decide how that hit changes its "age".
+-   //
+-   // CURRENT BASELINE:
+-   //   - On a hit, reduce age by 1 (toward 0) but never below 0.
+-   //   - This gently nudges frequently-accessed lines toward the
+-   //     "hard to evict" region.
+-   //
+-   // For the lab you can make this more interesting:
+-   //
+-   //   - Promote PTE hits more aggressively (e.g., set age=0).
+-   //   - Use different behaviors for TLB-walk hits vs normal hits.
+-   //   - Make promotion depend on how often the set sees PTE vs data
+-   //     traffic recently (translation intensity).
+-   //
+-   if (m_age[accessed_index] > 0)
+-      m_age[accessed_index]--;
++   resolvePendingInsert();
++   if (isPTE(accessed_index))
++   {
++      s_hits_pte++;
++      m_age[accessed_index] = std::min(m_age[accessed_index], m_pte_hit_age);
++   }
++   else
++   {
++      s_hits_data++;
++      if (m_age[accessed_index] > 0)
++         m_age[accessed_index]--;
++   }
+ }
+--- a/common/core/memory_subsystem/cache/cache_set_llc_template.h
++++ b/common/core/memory_subsystem/cache/cache_set_llc_template.h
+@@ -4,13 +4,31 @@
+ #include "cache_set.h"
+ #include <vector>
+ 
+-// Template replacement policy for the last-level cache (LLC).
+-// Provides a working baseline while leaving clear TODOs for students to
+-// experiment (e.g., RRIP variants, dynamic insertion policies).
++// CompArch 2025 Lab 6, Task 1.3: PTE-aware RRIP for the LLC ("llc_template").
++//
++// Per-way age (RRPV): 0 = keep, max = evict. Data lines behave exactly like
++// the baseline SRRIP LLC (insert at max-1, a hit decrements the age), so any
++// difference comes from how page-table (PTE) lines are treated:
++//
++//  * Insert: PTE line requested by a walk the TLB<->LLC Bloom filter flagged
++//            (translation recently evicted from the L2 TLB; the hint is tagged
++//            on the line address, see pte_priority_hint.h) -> insert_pte_hint;
++//            other PTE lines -> insert_pte; data -> insert_data.
++//  * Hit:    PTE line -> pte_hit_age (default 0); data -> age-1 (as SRRIP).
++//  * Victim: among lines at max age, prefer data over PTE lines.
++//  * Anti-starvation: once a set holds >= max_pte_ways PTE lines, PTE lines
++//            lose all protection (inserted like data, preferred as victims),
++//            so data always keeps at least (assoc - max_pte_ways) ways.
++//
++// Config (optional) under <cache cfg>/llc_pte/: bits, insert_data, insert_pte,
++// insert_pte_hint, pte_hit_age, max_pte_ways. Setting insert_pte =
++// insert_pte_hint gives a type-only policy (no Bloom filter influence);
++// setting everything to the data values gives plain SRRIP.
+ class CacheSetLLCTemplate : public CacheSet
+ {
+    public:
+-      CacheSetLLCTemplate(CacheBase::cache_t cache_type,
++      CacheSetLLCTemplate(String cfgname, core_id_t core_id,
++            CacheBase::cache_t cache_type,
+             UInt32 associativity, UInt32 blocksize, bool is_tlb_set);
+       ~CacheSetLLCTemplate() {}
+ 
+@@ -18,10 +36,28 @@
+       void updateReplacementIndex(UInt32 accessed_index);
+ 
+    private:
+-      std::vector<UInt8> m_age;   // Tiny age state per way (students can tune width).
++      std::vector<UInt8> m_age;
+       UInt8 m_max_age;
+-      UInt8 m_insert_age;
++      UInt8 m_insert_data;
++      UInt8 m_insert_pte;
++      UInt8 m_insert_pte_hint;
++      UInt8 m_pte_hit_age;
++      UInt32 m_max_pte_ways;
+       UInt32 m_hand;
++
++      // Victim is chosen before CacheSet::insert() copies in the new block, so
++      // its type is only known on the next call into this set.
++      SInt32 m_pending_way;
++      bool m_pending_hint;
++
++      bool isPTE(UInt32 way) const;
++      UInt32 countPTE() const;
++      void resolvePendingInsert();
++
++      // Aggregated over all LLC sets.
++      static bool s_stats_registered;
++      static UInt64 s_fills_pte, s_fills_pte_hint, s_fills_data;
++      static UInt64 s_evict_pte, s_evict_data, s_hits_pte, s_hits_data, s_cap_reached;
+ };
+ 
+ #endif /* CACHE_SET_LLC_TEMPLATE_H */
+--- a/common/core/memory_subsystem/cache/cache_set_tlb_template.cc
++++ b/common/core/memory_subsystem/cache/cache_set_tlb_template.cc
+@@ -1,72 +1,156 @@
+ #include "cache_set_tlb_template.h"
++#include "simulator.h"
++#include "config.hpp"
+ #include "log.h"
+ 
+-//@kanellok: CompArch25 - Lab 6
+-// Template policy used by TLB sets.
+-// Current behaviour is intentionally simple (round-robin after filling
+-// invalid ways). 
++// CompArch 2025 Lab 6, Task 1.2: page-size-aware SRRIP (see header for the policy).
++
++namespace
++{
++   SInt64 cfgInt(const String &key, core_id_t core_id, SInt64 dflt)
++   {
++      if (Sim()->getCfg()->hasKey(key))
++         return Sim()->getCfg()->getIntArray(key, core_id);
++      return dflt;
++   }
++}
+ 
+ CacheSetTLBTemplate::CacheSetTLBTemplate(
++      String cfgname, core_id_t core_id,
+       CacheBase::cache_t cache_type,
+       UInt32 associativity, UInt32 blocksize, bool is_tlb_set)
+    : CacheSet(cache_type, associativity, blocksize, is_tlb_set)
+-   , m_replacement_pointer(0)
++   , m_pending_way(-1)
++{
++   const String p = cfgname + "/psa/";
++   const UInt32 bits = cfgInt(p + "bits", core_id, 2);
++   LOG_ASSERT_ERROR(bits >= 1 && bits <= 7, "psa/bits must be in [1,7]");
++   m_rrpv_max = (1 << bits) - 1;
++   m_insert_4k = std::min<SInt64>(cfgInt(p + "insert_4k", core_id, m_rrpv_max - 1), m_rrpv_max);
++   m_insert_2m = std::min<SInt64>(cfgInt(p + "insert_2m", core_id, m_rrpv_max >= 2 ? 1 : 0), m_rrpv_max);
++   m_huge_aging_period = std::max<SInt64>(cfgInt(p + "huge_aging_period", core_id, 2), 1);
++   m_max_huge_ways = std::min<SInt64>(cfgInt(p + "max_huge_ways", core_id, associativity > 2 ? associativity - 2 : associativity), associativity);
++
++   m_rrpv.assign(m_associativity, m_rrpv_max);
++   m_age_credit.assign(m_associativity, 0);
++}
++
++bool
++CacheSetTLBTemplate::isHuge(UInt32 way) const
++{
++   return m_cache_block_info_array[way]->isValid()
++       && m_cache_block_info_array[way]->getPageSize() == PAGE_2MB;
++}
++
++bool
++CacheSetTLBTemplate::protectionActive() const
++{
++   UInt32 huge = 0;
++   for (UInt32 i = 0; i < m_associativity; i++)
++      if (isHuge(i))
++         huge++;
++   return huge <= m_max_huge_ways;
++}
++
++void
++CacheSetTLBTemplate::resolvePendingInsert()
++{
++   if (m_pending_way < 0)
++      return;
++   const UInt32 w = m_pending_way;
++   m_pending_way = -1;
++   if (!m_cache_block_info_array[w]->isValid())
++      return;
++   m_rrpv[w] = isHuge(w) ? m_insert_2m : m_insert_4k;
++   m_age_credit[w] = 0;
++}
++
++void
++CacheSetTLBTemplate::age(bool protect)
+ {
+-   // Hint: if you want to bias against evicting huge pages or recent PCIDs,
+-   // add your metadata vectors here and initialize them.
++   for (UInt32 i = 0; i < m_associativity; i++)
++   {
++      if (m_rrpv[i] >= m_rrpv_max)
++         continue;
++      if (protect && isHuge(i))
++      {
++         if (++m_age_credit[i] < m_huge_aging_period)
++            continue;
++         m_age_credit[i] = 0;
++      }
++      m_rrpv[i]++;
++   }
+ }
+ 
+ UInt32
+ CacheSetTLBTemplate::getReplacementIndex(CacheCntlr *cntlr)
+ {
+-   // Always take an invalid way if available (good for cold-start paths).
++   resolvePendingInsert();
++
++   // Cold start: always take an invalid way first.
+    for (UInt32 i = 0; i < m_associativity; i++)
+    {
+       if (!m_cache_block_info_array[i]->isValid())
++      {
++         m_pending_way = i;
+          return i;
++      }
+    }
+ 
++   const bool protect = protectionActive();
+ 
+-   //@kanellok: CompArch25 - Lab 6
+-   // TODO(student): swap this simple round-robin for your policy.
+-   // Ideas:
+-   //  - Protect large pages.
+-   //  - Estimate the reuse distance of each TLB entry(using lightweight ML?)
+-   //  - Estimate/track access frequency for each entry.
+-   //  - Estimate cost of translating a to-be evicted entry.
+-   //  - Track instruction-pointer signatures to spot streaming walks.
+-
+-   UInt32 index = m_replacement_pointer;
+-   m_replacement_pointer = (m_replacement_pointer + 1) % m_associativity;
+-
+-   if (!isValidReplacement(index))
++   // Bounded: every round ages each 4KB entry (and, every huge_aging_period
++   // rounds, each 2MB entry) by one, so some way reaches max within
++   // (max+1) * huge_aging_period rounds.
++   const UInt32 max_rounds = (m_rrpv_max + 1) * m_huge_aging_period + 1;
++   for (UInt32 round = 0; round <= max_rounds; round++)
+    {
+-
++      SInt32 victim_4k = -1, victim_2m = -1;
+       for (UInt32 i = 0; i < m_associativity; i++)
+       {
+-         UInt32 candidate = (m_replacement_pointer + i) % m_associativity;
+-         if (isValidReplacement(candidate))
++         if (m_rrpv[i] < m_rrpv_max || !isValidReplacement(i))
++            continue;
++         if (isHuge(i))
+          {
+-            m_replacement_pointer = (candidate + 1) % m_associativity;
+-            return candidate;
++            if (victim_2m < 0) victim_2m = i;
+          }
++         else if (victim_4k < 0)
++            victim_4k = i;
+       }
+-      LOG_PRINT_ERROR("No valid TLB victim found");
++
++      SInt32 victim = -1;
++      if (victim_4k >= 0 && (protect || victim_2m < 0))
++         victim = victim_4k;
++      else if (victim_2m >= 0 && (!protect || victim_4k < 0))
++         victim = victim_2m;
++      else if (victim_4k >= 0)
++         victim = victim_4k;
++
++      if (victim >= 0)
++      {
++         m_pending_way = victim;
++         return victim;
++      }
++      age(protect);
+    }
+ 
+-   return index;
++   // Fallback (e.g. every way locked by isValidReplacement): first valid candidate.
++   for (UInt32 i = 0; i < m_associativity; i++)
++   {
++      if (isValidReplacement(i))
++      {
++         m_pending_way = i;
++         return i;
++      }
++   }
++   LOG_PRINT_ERROR("No valid TLB victim found");
++   return 0;
+ }
+ 
+ void
+ CacheSetTLBTemplate::updateReplacementIndex(UInt32 accessed_index)
+ {
+-   //@kanellok: CompArch25 - Lab 6
+-   // TODO(students): teach the policy about accesses.
+-   // For example:
+-   //  - Reset/update your counters on a TLB hit.
+-   //  - Track hit/miss ratios for large vs. base pages.
+-   //  - Keep a reuse counter to bias replacement for shared pages.
+-   // - Probablistic set-based structures like bloom filters or sketches can help you 
+-   //   track access frequencies and/or cost of translating without per-entry metadata.
+-   (void) accessed_index;
++   resolvePendingInsert();
++   m_rrpv[accessed_index] = 0;   // hit priority: predicted near re-reference
++   m_age_credit[accessed_index] = 0;
+ }
+--- a/common/core/memory_subsystem/cache/cache_set_tlb_template.h
++++ b/common/core/memory_subsystem/cache/cache_set_tlb_template.h
+@@ -2,14 +2,31 @@
+ #define CACHE_SET_TLB_TEMPLATE_H
+ 
+ #include "cache_set.h"
++#include <vector>
+ 
+-// Template replacement policy meant for the TLB sets.
+-// Keep the code compiling and simple, but leave breadcrumbs for students to
+-// design a smarter policy (e.g., PCID-aware or huge-page-aware).
++// CompArch 2025 Lab 6, Task 1.2: page-size-aware SRRIP for the L2 TLB ("tlb_template").
++//
++// Per-way state: an RRPV (re-reference prediction value, 0 = keep, max = evict)
++// plus an aging credit used to make 2MB entries age slower.
++//
++//  * Insert: 4KB entries at insert_4k (default max-1), 2MB at insert_2m (default 1).
++//  * Hit:    RRPV = 0 (hit priority).
++//  * Victim: first way with RRPV == max; while protection is active, a 4KB way
++//            at max is preferred over a 2MB way at max.
++//  * Aging:  if no way is at max, every 4KB entry ages by 1; protected 2MB
++//            entries age by 1 only every huge_aging_period aging rounds.
++//  * Anti-starvation: protection is disabled for a set holding more than
++//            max_huge_ways 2MB entries, so 4KB translations always keep room.
++//            Unused 2MB entries still reach max and get evicted (just slower).
++//
++// Config (all optional, under <tlb cfg>/psa/): bits, insert_4k, insert_2m,
++// huge_aging_period, max_huge_ways.  huge_aging_period = 1 and insert_2m =
++// insert_4k turns the policy into plain SRRIP.
+ class CacheSetTLBTemplate : public CacheSet
+ {
+    public:
+-      CacheSetTLBTemplate(CacheBase::cache_t cache_type,
++      CacheSetTLBTemplate(String cfgname, core_id_t core_id,
++            CacheBase::cache_t cache_type,
+             UInt32 associativity, UInt32 blocksize, bool is_tlb_set);
+       ~CacheSetTLBTemplate() {}
+ 
+@@ -17,7 +34,25 @@
+       void updateReplacementIndex(UInt32 accessed_index);
+ 
+    private:
+-      UInt32 m_replacement_pointer;
++      static const int PAGE_2MB = 21;
++
++      UInt8 m_rrpv_max;
++      UInt8 m_insert_4k;
++      UInt8 m_insert_2m;
++      UInt32 m_huge_aging_period;
++      UInt32 m_max_huge_ways;
++
++      std::vector<UInt8> m_rrpv;
++      std::vector<UInt8> m_age_credit;
++      // The victim is chosen before CacheSet::insert() copies in the new block,
++      // so its page size is unknown here; remember the way and set its
++      // insertion RRPV on the next call into this set.
++      SInt32 m_pending_way;
++
++      bool isHuge(UInt32 way) const;
++      bool protectionActive() const;
++      void resolvePendingInsert();
++      void age(bool protect);
+ };
+ 
+ #endif /* CACHE_SET_TLB_TEMPLATE_H */
+--- a/common/core/memory_subsystem/cache/pte_priority_hint.cc
++++ b/common/core/memory_subsystem/cache/pte_priority_hint.cc
+@@ -0,0 +1,169 @@
++#include "pte_priority_hint.h"
++#include "simulator.h"
++#include "config.hpp"
++#include "stats.h"
++#include "log.h"
++
++// CompArch 2025 Lab 6, Task 1.3 (see header).
++
++bool PtePriorityHint::s_initialized = false;
++bool PtePriorityHint::s_in_walk = false;
++bool PtePriorityHint::s_walk_hint = false;
++UInt32 PtePriorityHint::s_bits = 65536;
++UInt32 PtePriorityHint::s_hashes = 2;
++UInt32 PtePriorityHint::s_epoch = 4096;
++UInt32 PtePriorityHint::s_active = 0;
++UInt64 PtePriorityHint::s_inserts_in_epoch = 0;
++std::vector<std::vector<bool> > PtePriorityHint::s_banks;
++UInt64 PtePriorityHint::s_stat_inserts = 0;
++UInt64 PtePriorityHint::s_stat_rotations = 0;
++UInt64 PtePriorityHint::s_stat_walks = 0;
++UInt64 PtePriorityHint::s_stat_hinted_walks = 0;
++UInt64 PtePriorityHint::s_stat_hinted_lines = 0;
++UInt64 PtePriorityHint::s_stat_hinted_fills = 0;
++UInt64 PtePriorityHint::s_stat_flag_mismatch = 0;
++std::mutex PtePriorityHint::s_lines_lock;
++std::deque<IntPtr> PtePriorityHint::s_lines_fifo;
++std::unordered_set<IntPtr> PtePriorityHint::s_lines;
++thread_local bool PtePriorityHint::t_insert_hint = false;
++
++namespace
++{
++   SInt64 cfgInt(const String &key, SInt64 dflt)
++   {
++      if (Sim() && Sim()->getCfg()->hasKey(key))
++         return Sim()->getCfg()->getInt(key);
++      return dflt;
++   }
++}
++
++void
++PtePriorityHint::init()
++{
++   if (s_initialized)
++      return;
++   s_initialized = true;
++   s_bits = std::max<SInt64>(cfgInt("perf_model/pte_bloom/bits", 65536), 64);
++   s_hashes = std::max<SInt64>(cfgInt("perf_model/pte_bloom/hashes", 2), 1);
++   s_epoch = std::max<SInt64>(cfgInt("perf_model/pte_bloom/epoch", 4096), 1);
++   s_banks.assign(2, std::vector<bool>(s_bits, false));
++
++   registerStatsMetric("pte_bloom", 0, "inserts", &s_stat_inserts);
++   registerStatsMetric("pte_bloom", 0, "rotations", &s_stat_rotations);
++   registerStatsMetric("pte_bloom", 0, "walks", &s_stat_walks);
++   registerStatsMetric("pte_bloom", 0, "hinted_walks", &s_stat_hinted_walks);
++   registerStatsMetric("pte_bloom", 0, "hinted_lines", &s_stat_hinted_lines);
++   registerStatsMetric("pte_bloom", 0, "hinted_llc_fills", &s_stat_hinted_fills);
++   registerStatsMetric("pte_bloom", 0, "old_flag_mismatch", &s_stat_flag_mismatch);
++}
++
++UInt64
++PtePriorityHint::key(IntPtr vaddr, int page_size_bits)
++{
++   // VPN plus page size, so a 4KB and a 2MB translation never alias by construction.
++   return (UInt64(vaddr) >> page_size_bits) ^ (UInt64(page_size_bits) << 56);
++}
++
++UInt64
++PtePriorityHint::hash(UInt64 k, UInt32 i)
++{
++   // splitmix64 finaliser with a per-function seed: cheap, well mixed.
++   UInt64 z = k + 0x9e3779b97f4a7c15ULL * (i + 1);
++   z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++   z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++   z = z ^ (z >> 31);
++   return z % s_bits;
++}
++
++bool
++PtePriorityHint::bankContains(UInt32 bank, UInt64 k)
++{
++   for (UInt32 i = 0; i < s_hashes; i++)
++      if (!s_banks[bank][hash(k, i)])
++         return false;
++   return true;
++}
++
++void
++PtePriorityHint::recordTlbEviction(IntPtr vaddr, int page_size_bits)
++{
++   init();
++   const UInt64 k = key(vaddr, page_size_bits);
++   for (UInt32 i = 0; i < s_hashes; i++)
++      s_banks[s_active][hash(k, i)] = true;
++   s_stat_inserts++;
++
++   if (++s_inserts_in_epoch >= s_epoch)
++   {
++      // Rotate: the older bank is cleared and becomes the active one.
++      s_active ^= 1;
++      std::fill(s_banks[s_active].begin(), s_banks[s_active].end(), false);
++      s_inserts_in_epoch = 0;
++      s_stat_rotations++;
++   }
++}
++
++bool
++PtePriorityHint::containsPage(IntPtr vaddr)
++{
++   init();
++   const int sizes[2] = {12, 21};
++   for (int s = 0; s < 2; s++)
++   {
++      const UInt64 k = key(vaddr, sizes[s]);
++      if (bankContains(0, k) || bankContains(1, k))
++         return true;
++   }
++   return false;
++}
++
++void
++PtePriorityHint::beginWalk(IntPtr vaddr)
++{
++   s_walk_hint = containsPage(vaddr);
++   s_in_walk = true;
++   s_stat_walks++;
++   if (s_walk_hint)
++      s_stat_hinted_walks++;
++}
++
++void
++PtePriorityHint::endWalk()
++{
++   s_in_walk = false;
++   s_walk_hint = false;
++}
++
++void
++PtePriorityHint::markHintedLine(IntPtr line_addr)
++{
++   line_addr &= ~IntPtr(63);
++   std::lock_guard<std::mutex> g(s_lines_lock);
++   if (s_lines.insert(line_addr).second)
++   {
++      s_lines_fifo.push_back(line_addr);
++      s_stat_hinted_lines++;
++      if (s_lines_fifo.size() > LINES_CAPACITY)
++      {
++         s_lines.erase(s_lines_fifo.front());
++         s_lines_fifo.pop_front();
++      }
++   }
++}
++
++bool
++PtePriorityHint::isHintedLine(IntPtr line_addr)
++{
++   line_addr &= ~IntPtr(63);
++   std::lock_guard<std::mutex> g(s_lines_lock);
++   return s_lines.count(line_addr) != 0;
++}
++
++void
++PtePriorityHint::countFill(bool addr_hint, bool racy_flag_hint)
++{
++   // Called for every PAGE_TABLE fill into the LLC: how often would the old
++   // global walk flag have given a different answer than the address tag?
++   if (addr_hint) s_stat_hinted_fills++;
++   if (addr_hint != racy_flag_hint) s_stat_flag_mismatch++;
++}
+--- a/common/core/memory_subsystem/cache/pte_priority_hint.h
++++ b/common/core/memory_subsystem/cache/pte_priority_hint.h
+@@ -0,0 +1,76 @@
++#ifndef PTE_PRIORITY_HINT_H
++#define PTE_PRIORITY_HINT_H
++
++#include "fixed_types.h"
++#include <vector>
++#include <deque>
++#include <unordered_set>
++#include <mutex>
++
++// CompArch 2025 Lab 6, Task 1.3: TLB <-> LLC co-design side structure.
++//
++// A small Bloom filter remembers the virtual pages that were recently evicted
++// from the last-level (L2) TLB. When the hardware page-table walker starts a
++// walk for a virtual address that hits in the filter, the translation is one
++// that (a) was useful enough to be cached in the TLB before and (b) is
++// currently missing from the TLB. The walker then tags its memory requests
++// with a one-bit "priority" hint, which the LLC replacement policy
++// (CacheSetLLCTemplate) uses to insert/retain those PTE lines more strongly.
++//
++// The filter has two banks that rotate every `epoch` insertions (the older
++// bank is cleared), so "recently evicted" means within the last 1-2 epochs and
++// the filter never saturates.
++//
++// Config (optional, defaults in brackets), section perf_model/pte_bloom:
++//   bits   [65536]  bits per bank (2 banks -> 16 KB total at the default)
++//   hashes [2]      hash functions
++//   epoch  [4096]   insertions per bank before rotation
++//
++// The hint travels with the request *address*: the walker (core thread) records
++// the PTE cache lines that a hinted walk requests (markHintedLine), and the LLC
++// fill path (Sniper's sim thread) looks the filled line up (isHintedLine) and
++// passes the result to the replacement policy via a thread-local "insert hint".
++// (A first version used a global "walk in progress" flag; DRAM replies wake the
++// core before the LLC fill happens on the sim thread, so that flag was racy.)
++class PtePriorityHint
++{
++   public:
++      static void init();                                   // idempotent; registers stats
++      static void recordTlbEviction(IntPtr vaddr, int page_size_bits);
++      static bool containsPage(IntPtr vaddr);               // 4KB or 2MB granularity
++      static void beginWalk(IntPtr vaddr);
++      static void endWalk();
++      static bool inWalk() { return s_in_walk; }
++      static bool walkHint() { return s_in_walk && s_walk_hint; }   // core thread only
++
++      // Address-tagged hint (thread-safe)
++      static void markHintedLine(IntPtr line_addr);           // core thread, during a hinted walk
++      static bool isHintedLine(IntPtr line_addr);             // LLC fill path
++      static void setInsertHint(bool h) { t_insert_hint = h; } // set by the LLC fill path, same thread
++      static bool insertHint() { return t_insert_hint; }      // read by the LLC policy
++      static void countFill(bool addr_hint, bool racy_flag_hint);
++
++   private:
++      static bool s_initialized;
++      static bool s_in_walk;
++      static bool s_walk_hint;
++      static UInt32 s_bits, s_hashes, s_epoch;
++      static UInt32 s_active;                               // index of the bank being filled
++      static UInt64 s_inserts_in_epoch;
++      static std::vector<std::vector<bool> > s_banks;
++
++      static UInt64 s_stat_inserts, s_stat_rotations, s_stat_walks, s_stat_hinted_walks;
++      static UInt64 s_stat_hinted_lines, s_stat_hinted_fills, s_stat_flag_mismatch;
++
++      static std::mutex s_lines_lock;
++      static std::deque<IntPtr> s_lines_fifo;
++      static std::unordered_set<IntPtr> s_lines;
++      static const size_t LINES_CAPACITY = 4096;
++      static thread_local bool t_insert_hint;
++
++      static UInt64 key(IntPtr vaddr, int page_size_bits);
++      static UInt64 hash(UInt64 key, UInt32 i);
++      static bool bankContains(UInt32 bank, UInt64 key);
++};
++
++#endif // PTE_PRIORITY_HINT_H
+--- a/common/core/memory_subsystem/parametric_dram_directory_msi/mmu_base.cc
++++ b/common/core/memory_subsystem/parametric_dram_directory_msi/mmu_base.cc
+@@ -1,5 +1,6 @@
+ 
+ 
++#include "pte_priority_hint.h"
+ #include "./memory_manager.h"
+ #include "cache_cntlr.h"
+ #include "subsecond_time.h"
+@@ -67,6 +68,10 @@
+ 		IntPtr cache_address = ((IntPtr)(packet.address)) & (~((64 - 1)));
+ 		CacheCntlr *l1d_cache = memory_manager->getCacheCntlrAt(core->getId(), MemComponent::component_t::L1_DCACHE);
+ 
++		// Lab 6 Task 1.3: the walk's PTE requests carry the Bloom-filter hint (by address)
++		if (packet.type == CacheBlockInfo::block_type_t::PAGE_TABLE && PtePriorityHint::walkHint())
++			PtePriorityHint::markHintedLine(cache_address);
++
+ 		// Update the elapsed time in the performance model so that we send the request to the cache at the correct time
+ 		// Example: we need to access 4 levels of the page table:
+ 		// 1. Access the first level of the page table at time t_start
+--- a/common/core/memory_subsystem/parametric_dram_directory_msi/mmu_designs/mmu.cc
++++ b/common/core/memory_subsystem/parametric_dram_directory_msi/mmu_designs/mmu.cc
+@@ -1,4 +1,5 @@
+ 
++#include "pte_priority_hint.h"
+ #include "mmu.h"
+ #include "mmu_base.h"
+ #include "memory_manager.h"
+@@ -367,6 +368,8 @@
+ 				log_file << "[MMU] Starting PTW at time: " << shmem_perf_model->getElapsedTime(ShmemPerfModel::_USER_THREAD).getNS() << std::endl;
+ 			#endif
+ 			
++			// Lab 6 Task 1.3: tag this walk's PTE requests with the Bloom-filter hint
++			PtePriorityHint::beginWalk(address);
+ 			auto ptw_result = performPTW(address, modeled, count, false, eip, lock, page_table, restart_walk_upon_page_fault);
+ 			total_walk_latency = get<0>(ptw_result); // Total walk latency is only the time it takes to walk the page table (excluding page faults)
+ 
+@@ -430,6 +433,8 @@
+ 			4) Total fault latency
+ 			*/
+ 
++			PtePriorityHint::endWalk(); // Lab 6 Task 1.3
++
+ 			pt_walker_entry.completion_time = time_for_pt + delay + total_walk_latency + total_fault_latency;
+ 			pt_walkers->allocate(pt_walker_entry);
+ 
+@@ -554,6 +559,12 @@
+ 		}
+ 
+ 		
++		// Lab 6 Task 1.3: translations evicted from the last TLB level are no longer
++		// cached anywhere in the TLB hierarchy -> remember them in the Bloom filter.
++		if (tlb_levels > 0)
++			for (const auto &ev : evicted_translations[tlb_levels - 1])
++				PtePriorityHint::recordTlbEviction(get<0>(ev), get<1>(ev));
++
+ 		translation_stats.total_translation_latency += charged_tlb_latency + total_walk_latency;
+ 
+ 		// We need to calculate the physical address
+--- a/common/core/memory_subsystem/parametric_dram_directory_msi/nuca_cache.cc
++++ b/common/core/memory_subsystem/parametric_dram_directory_msi/nuca_cache.cc
+@@ -1,3 +1,4 @@
++#include "pte_priority_hint.h"
+ #include "nuca_cache.h"
+ #include "memory_manager_base.h"
+ #include "pr_l1_cache_block_info.h"
+@@ -58,7 +59,7 @@
+ }
+ 
+ boost::tuple<SubsecondTime, HitWhere::where_t>
+-NucaCache::read(IntPtr address, Byte* data_buf, SubsecondTime now, ShmemPerf *perf, bool count,bool is_metadata)
++NucaCache::read(IntPtr address, Byte* data_buf, SubsecondTime now, ShmemPerf *perf, bool count, CacheBlockInfo::block_type_t block_type)
+ {
+    //std::cout<<"Nuca Read:"<<is_metadata<<"\n";
+    HitWhere::where_t hit_where = HitWhere::MISS;
+@@ -92,7 +93,7 @@
+ }
+ 
+ boost::tuple<SubsecondTime, HitWhere::where_t>
+-NucaCache::write(IntPtr address, Byte* data_buf, bool& eviction, IntPtr& evict_address, Byte* evict_buf, SubsecondTime now, bool count,bool is_metadata)
++NucaCache::write(IntPtr address, Byte* data_buf, bool& eviction, IntPtr& evict_address, Byte* evict_buf, SubsecondTime now, bool count, CacheBlockInfo::block_type_t block_type, CacheBlockInfo::block_type_t* evict_block_type)
+ {
+    HitWhere::where_t hit_where = HitWhere::MISS;
+ 
+@@ -111,12 +112,22 @@
+    {
+       PrL1CacheBlockInfo evict_block_info;
+ 
++      // Lab 6 Task 1.3: hint for exactly this line (race-free; see pte_priority_hint.h)
++      const bool is_pt = (block_type == CacheBlockInfo::block_type_t::PAGE_TABLE);
++      const bool hint = is_pt && PtePriorityHint::isHintedLine(address);
++      if (is_pt)
++         PtePriorityHint::countFill(hint, PtePriorityHint::walkHint());
++      PtePriorityHint::setInsertHint(hint);
+       m_cache->insertSingleLine(address, data_buf,
+          &eviction, &evict_address, &evict_block_info, evict_buf,
+-         now + latency);
++         now + latency, NULL, block_type); // Lab 6: LLC policy sees PTE vs data at fill
++      PtePriorityHint::setInsertHint(false);
+ 
+       if (eviction)
+       {
++         // Lab 6: report the *victim's* type so its write-back is classified correctly
++         if (evict_block_type)
++            *evict_block_type = evict_block_info.getBlockType();
+          if (evict_block_info.getCState() != CacheState::MODIFIED)
+          {
+             // Unless data is dirty, don't have caller write it back
+--- a/common/core/memory_subsystem/parametric_dram_directory_msi/nuca_cache.h
++++ b/common/core/memory_subsystem/parametric_dram_directory_msi/nuca_cache.h
+@@ -39,8 +39,8 @@
+       NucaCache(MemoryManagerBase* memory_manager, ShmemPerfModel* shmem_perf_model, AddressHomeLookup* home_lookup, UInt32 cache_block_size, ParametricDramDirectoryMSI::CacheParameters& parameters);
+       ~NucaCache();
+ 
+-      boost::tuple<SubsecondTime, HitWhere::where_t> read(IntPtr address, Byte* data_buf, SubsecondTime now, ShmemPerf *perf, bool count,bool is_metadata);
+-      boost::tuple<SubsecondTime, HitWhere::where_t> write(IntPtr address, Byte* data_buf, bool& eviction, IntPtr& evict_address, Byte* evict_buf, SubsecondTime now, bool count,bool is_metadata);
++      boost::tuple<SubsecondTime, HitWhere::where_t> read(IntPtr address, Byte* data_buf, SubsecondTime now, ShmemPerf *perf, bool count, CacheBlockInfo::block_type_t block_type);
++      boost::tuple<SubsecondTime, HitWhere::where_t> write(IntPtr address, Byte* data_buf, bool& eviction, IntPtr& evict_address, Byte* evict_buf, SubsecondTime now, bool count, CacheBlockInfo::block_type_t block_type, CacheBlockInfo::block_type_t* evict_block_type = NULL);
+       void markTranslationMetadata(IntPtr address, CacheBlockInfo::block_type_t blocktype);
+       Cache* getCache(){return m_cache;}
+       void measureStats();
+--- a/common/core/memory_subsystem/parametric_dram_directory_msi/translation_components/tlb.cc
++++ b/common/core/memory_subsystem/parametric_dram_directory_msi/translation_components/tlb.cc
+@@ -15,6 +15,7 @@
+ #include "address_home_lookup.h"
+ #include "fault_injection.h"
+ #include "memory_manager.h"
++#include "simulator.h"
+ 
+ // #define DEBUG_TLB
+ // #define TLB_STATS
+@@ -22,6 +23,17 @@
+ namespace ParametricDramDirectoryMSI
+ {
+ 
++    // Lab 6 Task 1.2: optional per-TLB "replacement_policy" key (default "lru",
++    // i.e. the original hard-coded behaviour). E.g. in
++    // [perf_model/mmu/tlb_level_2/tlb1]: replacement_policy = "tlb_template"
++    static String tlbReplacementPolicy(const String &cfgname, core_id_t core_id)
++    {
++        String key = cfgname + "/replacement_policy";
++        if (Sim()->getCfg()->hasKey(key))
++            return Sim()->getCfg()->getStringArray(key, core_id);
++        return "lru";
++    }
++
+     // @kanellok CompArch 2025 Lab 6
+     // As you can see, the TLB class constructor takes a lot of parameters
+     // You need to modify the TLB constructor to change the replacement policy of the TLB
+@@ -30,7 +42,7 @@
+         : m_size(num_entries), m_core_id(core_id), m_name(name), m_associativity(associativity), m_cache(name + "_cache",
+                                                                                                          cfgname,
+                                                                                                          core_id, num_entries / associativity,
+-                                                                                                         associativity, (1L << 3), "lru",
++                                                                                                         associativity, (1L << 3), tlbReplacementPolicy(cfgname, core_id),
+                                                                                                          CacheBase::PR_L1_CACHE, CacheBase::HASH_MASK,
+                                                                                                          NULL,
+                                                                                                          NULL, true, page_size_list, page_sizes),
+@@ -74,7 +86,53 @@
+         registerStatsMetric(name, core_id, "hits", &tlb_stats.m_hit);
+         registerStatsMetric(name, core_id, "misses", &tlb_stats.m_miss);
+         registerStatsMetric(name, core_id, "evictions", &tlb_stats.m_eviction);
++        registerStatsMetric(name, core_id, "hits_4k", &tlb_stats.m_hit_4k);
++        registerStatsMetric(name, core_id, "hits_2m", &tlb_stats.m_hit_2m);
++        registerStatsMetric(name, core_id, "evictions_4k", &tlb_stats.m_eviction_4k);
++        registerStatsMetric(name, core_id, "evictions_2m", &tlb_stats.m_eviction_2m);
++
++        // Lab 6 Task 1.1: TLB memory reach (sampled whenever stats are written)
++        Sim()->getStatsManager()->registerMetric(new StatsMetricCallback(name, core_id, "memory_reach_kb", statsCallback, (UInt64)this));
++        Sim()->getStatsManager()->registerMetric(new StatsMetricCallback(name, core_id, "valid_entries_4k", statsCallback, (UInt64)this));
++        Sim()->getStatsManager()->registerMetric(new StatsMetricCallback(name, core_id, "valid_entries_2m", statsCallback, (UInt64)this));
++    }
+ 
++    UInt64 TLB::countValidEntries(int page_size_bits) const
++    {
++        UInt64 count = 0;
++        for (UInt32 s = 0; s < m_cache.getNumSets(); s++)
++            for (UInt32 w = 0; w < m_cache.getAssociativity(); w++)
++            {
++                CacheBlockInfo *b = m_cache.peekBlock(s, w);
++                if (b && b->isValid() && b->getPageSize() == page_size_bits)
++                    count++;
++            }
++        return count;
++    }
++
++    UInt64 TLB::computeMemoryReachKB() const
++    {
++        UInt64 reach_bytes = 0;
++        for (UInt32 s = 0; s < m_cache.getNumSets(); s++)
++            for (UInt32 w = 0; w < m_cache.getAssociativity(); w++)
++            {
++                CacheBlockInfo *b = m_cache.peekBlock(s, w);
++                if (b && b->isValid() && b->getPageSize() > 0)
++                    reach_bytes += (UInt64(1) << b->getPageSize());
++            }
++        return reach_bytes >> 10;
++    }
++
++    UInt64 TLB::statsCallback(String objectName, UInt32 index, String metricName, UInt64 arg)
++    {
++        const TLB *tlb = (const TLB *)arg;
++        if (metricName == "memory_reach_kb")
++            return tlb->computeMemoryReachKB();
++        if (metricName == "valid_entries_4k")
++            return tlb->countValidEntries(12);
++        if (metricName == "valid_entries_2m")
++            return tlb->countValidEntries(21);
++        return 0;
+     }
+ 
+     CacheBlockInfo *TLB::lookup(IntPtr address, SubsecondTime now, bool model_count, Core::lock_signal_t lock_signal, IntPtr eip, bool modeled, bool count, PageTable *pt)
+@@ -99,6 +157,7 @@
+         if (hit)
+         {
+             tlb_stats.m_hit++;
++            if (hit->getPageSize() == 21) tlb_stats.m_hit_2m++; else tlb_stats.m_hit_4k++;
+             return hit;
+         }
+ 
+@@ -130,7 +189,10 @@
+         m_cache.insertSingleLineTLB(address, NULL, &eviction, &evict_addr, &evict_block_info, NULL, now, NULL, CacheBlockInfo::block_type_t::NON_PAGE_TABLE, page_size, ppn);
+ 
+         if (eviction && count)
++        {
+             tlb_stats.m_eviction++;
++            if (evict_block_info.getPageSize() == 21) tlb_stats.m_eviction_2m++; else tlb_stats.m_eviction_4k++;
++        }
+ 
+ #ifdef DEBUG_TLB
+         if (eviction)
+--- a/common/core/memory_subsystem/parametric_dram_directory_msi/translation_components/tlb.h
++++ b/common/core/memory_subsystem/parametric_dram_directory_msi/translation_components/tlb.h
+@@ -57,6 +57,7 @@
+ 		{
+ 			
+ 			UInt64 m_access, m_hit, m_miss, m_eviction;
++			UInt64 m_hit_4k, m_hit_2m, m_eviction_4k, m_eviction_2m; // Lab 6 Task 1.2
+ 
+ 		} tlb_stats;
+ 
+@@ -73,6 +74,12 @@
+ 		bool getPrefetch() { return m_prefetch; };
+ 		int getEntrySize() { return entry_size; };
+ 		SubsecondTime getLatency() { return m_access_latency.getLatency(); };
++		// Lab 6 Task 1.1: memory reach = sum of page sizes covered by valid entries.
++		// Computed on demand (stats snapshot) by scanning every set/way.
++		UInt64 countValidEntries(int page_size_bits) const;
++		UInt64 computeMemoryReachKB() const;
++		static UInt64 statsCallback(String objectName, UInt32 index, String metricName, UInt64 arg);
++
+ 		bool supportsPageSize(int page_size)
+ 		{
+ 			for (int i = 0; i < m_page_sizes; i++)
+--- a/common/core/memory_subsystem/pr_l1_pr_l2_dram_directory_msi/dram_directory_cntlr.cc
++++ b/common/core/memory_subsystem/pr_l1_pr_l2_dram_directory_msi/dram_directory_cntlr.cc
+@@ -1230,11 +1230,14 @@
+       bool eviction;
+       IntPtr evict_address;
+       Byte evict_buf[getCacheBlockSize()];
++      // Lab 6 fix: the write-back below used the *incoming* line's block type, so dirty
++      // data evicted by a page-table fill was counted as a PAGE_TABLE DRAM write.
++      CacheBlockInfo::block_type_t evict_block_type = block_type;
+       m_nuca_cache->write(
+          address, data_buf,
+          eviction, evict_address, evict_buf,
+          getShmemPerfModel()->getElapsedTime(ShmemPerfModel::_SIM_THREAD),
+-         count,block_type
++         count,block_type, &evict_block_type
+       );
+ 
+       if (eviction)
+@@ -1251,7 +1254,7 @@
+                HitWhere::UNKNOWN,
+                &m_dummy_shmem_perf,
+                ShmemPerfModel::_SIM_THREAD,
+-               block_type);
++               evict_block_type);
+       }
+    }
+    MYLOG("End");
+--- a/common/performance_model/dram_perf_model_detailed.cc
++++ b/common/performance_model/dram_perf_model_detailed.cc
+@@ -129,6 +129,25 @@
+    registerStatsMetric("ddr", core_id, "page-conflict-metadata-to-metadata", &m_page_conflict_metadata_to_metadata);
+    registerStatsMetric("ddr", core_id, "page-conflict-data-to-data", &m_page_conflict_data_to_data);
+ 
++   // Lab 6 Task 2.3: per-type row-buffer stats ("pt" = PAGE_TABLE requests, "data" = everything else)
++   {
++      const char *tname[2] = {"data", "pt"};
++      for (int t = 0; t < 2; t++)
++      {
++         m_rb_hits[t] = m_rb_miss[t] = m_rb_closing[t] = m_rb_empty[t] = m_rb_reqs[t] = 0;
++         m_rb_latency[t] = SubsecondTime::Zero();
++         m_bank_accesses[t].assign(m_num_banks, 0);
++         registerStatsMetric("ddr", core_id, String("requests-") + tname[t], &m_rb_reqs[t]);
++         registerStatsMetric("ddr", core_id, String("page-hits-") + tname[t], &m_rb_hits[t]);
++         registerStatsMetric("ddr", core_id, String("page-miss-") + tname[t], &m_rb_miss[t]);
++         registerStatsMetric("ddr", core_id, String("page-closing-") + tname[t], &m_rb_closing[t]);
++         registerStatsMetric("ddr", core_id, String("page-empty-") + tname[t], &m_rb_empty[t]);
++         registerStatsMetric("ddr", core_id, String("total-latency-") + tname[t], &m_rb_latency[t]);
++         for (UInt32 b = 0; b < m_num_banks; b++)
++            registerStatsMetric("ddr", core_id, String("bank-") + itostr(b) + "-accesses-" + tname[t], &m_bank_accesses[t][b]);
++      }
++   }
++
+    registerStatsMetric("dram", core_id, "received-request-from-the-past", &m_received_request_from_the_past);
+    registerStatsMetric("dram", core_id, "received-request-from-the-unknown-past", &m_received_request_from_the_unknown_past);
+    registerStatsMetric("dram", core_id, "received-request-from-present", &m_received_request_from_the_present);
+@@ -367,7 +386,9 @@
+     std::map<UInt64, SubsecondTime>::iterator i;
+     SubsecondTime max=SubsecondTime::Zero();
+ 
+-      if(Sim()->getClockSkewMinimizationServer()->getGlobalTime()>pkt_time){
++      // Lab 6 fix: the clock-skew server is torn down at simulation end while late
++      // write-backs can still arrive here (segfault seen at shutdown); guard it.
++      if(Sim()->getClockSkewMinimizationServer() && Sim()->getClockSkewMinimizationServer()->getGlobalTime()>pkt_time){
+          max=Sim()->getClockSkewMinimizationServer()->getGlobalTime();
+       }
+       else{
+@@ -378,6 +399,9 @@
+    UInt32 channel, rank, bank_group, bank, column;
+    UInt64 page;
+    parseDeviceAddress(address, channel, rank, bank_group, bank, column, page);
++   const int rb_t = is_metadata ? 1 : 0; // Lab 6 Task 2.3
++   m_rb_reqs[rb_t]++;
++   m_bank_accesses[rb_t][bank]++;
+ 
+ 
+    #ifdef DEBUG_PRINT
+@@ -452,6 +476,7 @@
+          #endif
+       }
+       ++m_page_hits;
++      ++m_rb_hits[rb_t];
+    }
+    else
+    {
+@@ -485,6 +510,7 @@
+          #endif
+ 
+          ++m_page_miss;
++         ++m_rb_miss[rb_t];
+       }
+       else if (bank_info.t_avail + m_bank_keep_open + m_bank_close_delay > t_now)
+       {
+@@ -492,6 +518,7 @@
+          t_now = bank_info.t_avail + m_bank_keep_open +m_bank_close_delay;
+          
+          ++m_page_closing;
++         ++m_rb_closing[rb_t];
+          #ifdef DEBUG_PRINT
+             std::cout << "Row miss, waiting for DRAM bank to close at " << t_now.getNS() << std::endl;
+          #endif
+@@ -500,6 +527,7 @@
+       {
+          // Bank was already closed, no delay.
+          ++m_page_empty;
++         ++m_rb_empty[rb_t];
+ 
+       }
+       // Open page
+@@ -595,6 +623,7 @@
+    #endif
+    
+ 	//std::cout << "Result: Local" << std::endl;  
++	m_rb_latency[rb_t] += t_now - pkt_time; // Lab 6 Task 2.3
+ 	return t_now - pkt_time;
+    
+ }
+--- a/common/performance_model/dram_perf_model_detailed.h
++++ b/common/performance_model/dram_perf_model_detailed.h
+@@ -127,6 +127,10 @@
+       UInt64 m_page_conflict_data_to_metadata;
+       UInt64 m_page_conflict_data_to_data;
+       UInt64 m_page_conflict_metadata_to_metadata;
++      // Lab 6 Task 2.3: row-buffer outcome per request type, index 0 = NON_PAGE_TABLE (data), 1 = PAGE_TABLE
++      UInt64 m_rb_hits[2], m_rb_miss[2], m_rb_closing[2], m_rb_empty[2], m_rb_reqs[2];
++      SubsecondTime m_rb_latency[2];                 // summed DRAM access latency per type
++      std::vector<UInt64> m_bank_accesses[2];        // per bank index (0..num_banks-1, summed over channels/ranks)
+ 
+       UInt64 m_received_request_from_the_past;
+       UInt64 m_received_request_from_the_unknown_past;
+--- a/common/system/memory_management/physical_memory_allocators/pagetable_aware_allocator.cc
++++ b/common/system/memory_management/physical_memory_allocators/pagetable_aware_allocator.cc
+@@ -3,6 +3,8 @@
+ #include "stats.h"
+ #include "simulator.h"
+ #include "config.hpp"
++#include "utils.h"
++#include "log.h"
+ 
+ #include <utility>
+ #include <cmath>
+@@ -126,6 +128,126 @@
+    registerStatsMetric(name, 0, "two_mb_demoted", &stats.two_mb_demoted);
+    registerStatsMetric(name, 0, "total_allocations", &stats.total_allocations);
+    registerStatsMetric(name, 0, "kernel_pages_used", &stats.kernel_pages_used);
++
++   // ---- Lab 6 Task 2.2: DRAM-aware page-table placement ----------------
++   // Physical address -> DRAM mapping (dram_perf_model_detailed.cc, open-page
++   // mapping, column_offset = 0, one controller => linear address == PA):
++   //   PA[5:0] line offset | [ch] channel | [col] column | [rk] rank | [bk] bank | rest: row
++   // so the bank field starts at PA bit 6 + ch + col + rk (= 17 for ddr4_2400.cfg),
++   // i.e. PFN bit 5: every 4KB frame lives in exactly one bank (of one rank).
++   stats.pt_frames = stats.pt_frames_in_pt_bank = 0;
++   stats.data_frames_4k = stats.data_frames_in_pt_bank = 0;
++   stats.pt_pool_frames = stats.data_pool_frames = stats.pt_fallbacks = 0;
++   {
++      config::Config *cfg = Sim()->getCfg();
++      const String p = "perf_model/" + name + "/";
++      m_pt_isolation = cfg->hasKey(p + "pt_isolation") ? cfg->getBool(p + "pt_isolation") : false;
++      m_num_banks = cfg->getInt("perf_model/dram/ddr/num_banks");
++      m_pt_bank = cfg->hasKey(p + "pt_bank") ? cfg->getInt(p + "pt_bank") : m_num_banks - 1;
++      m_pt_num_banks = cfg->hasKey(p + "pt_num_banks") ? cfg->getInt(p + "pt_num_banks") : 1;
++      // Ablation modes: "full" (default) = PT only in reserved banks AND data never there;
++      // "pt_only" = PT confined, data unrestricted; "data_only" = data kept out, PT unrestricted.
++      const String mode = cfg->hasKey(p + "pt_isolation_mode") ? cfg->getString(p + "pt_isolation_mode") : "full";
++      LOG_ASSERT_ERROR(mode == "full" || mode == "pt_only" || mode == "data_only", "pt_isolation_mode must be full|pt_only|data_only");
++      m_isolate_pt = (mode != "data_only");
++      m_isolate_data = (mode != "pt_only");
++      LOG_ASSERT_ERROR(m_pt_num_banks >= 1 && m_pt_num_banks <= m_pt_bank + 1 && m_pt_num_banks < m_num_banks, "invalid pt_num_banks");
++      const UInt32 bank_shift_pa = 6 + cfg->getInt("perf_model/dram/ddr/required_channel_bits")
++                                     + cfg->getInt("perf_model/dram/ddr/dram_page_size_bits")
++                                     + cfg->getInt("perf_model/dram/ddr/required_rank_bits");
++      LOG_ASSERT_ERROR(bank_shift_pa >= 12, "bank bits below the 4KB page offset: bank isolation needs bank bits in the PFN");
++      LOG_ASSERT_ERROR((m_num_banks & (m_num_banks - 1)) == 0 && m_pt_bank < m_num_banks, "invalid num_banks/pt_bank");
++      if (m_pt_isolation)
++      {
++         LOG_ASSERT_ERROR(cfg->getBool("perf_model/dram/ddr/open_page_mapping") && cfg->getInt("perf_model/dram/ddr/column_offset") == 0
++                          && cfg->getInt("perf_model/dram/num_controllers") == 1,
++                          "pt_isolation assumes the open-page mapping with column_offset=0 and a single DRAM controller");
++      }
++      m_bank_shift_pfn = bank_shift_pa - 12;
++      log_file << "[PT-ISOLATION] enabled=" << m_pt_isolation << " mode=" << mode << " pt_banks=" << (m_pt_bank - m_pt_num_banks + 1) << ".." << m_pt_bank
++               << " num_banks=" << m_num_banks << " bank bits at PA[" << bank_shift_pa << ".."
++               << (bank_shift_pa + floorLog2(m_num_banks) - 1) << "]" << std::endl;
++   }
++   registerStatsMetric(name, 0, "pt_frames", &stats.pt_frames);
++   registerStatsMetric(name, 0, "pt_frames_in_pt_bank", &stats.pt_frames_in_pt_bank);
++   registerStatsMetric(name, 0, "data_frames_4k", &stats.data_frames_4k);
++   registerStatsMetric(name, 0, "data_frames_in_pt_bank", &stats.data_frames_in_pt_bank);
++   registerStatsMetric(name, 0, "pt_pool_frames", &stats.pt_pool_frames);
++   registerStatsMetric(name, 0, "data_pool_frames", &stats.data_pool_frames);
++   registerStatsMetric(name, 0, "pt_fallbacks", &stats.pt_fallbacks);
++}
++
++/*
++ * Lab 6 Task 2.2: reserved-region (page-table) frame allocation.
++ * Reserved-bank frames encountered while allocating data are parked in
++ * m_pt_pool; if it is empty we pull frames from the buddy until one lands in
++ * the reserved bank, parking the others in m_data_pool for later data use.
++ */
++UInt64 PageTableAwareAllocator::allocatePTFrame(UInt64 address, UInt64 core_id)
++{
++   UInt64 frame = static_cast<UInt64>(-1);
++   if (!m_pt_pool.empty())
++   {
++      frame = m_pt_pool.back();
++      m_pt_pool.pop_back();
++   }
++   else
++   {
++      while (true)
++      {
++         UInt64 f = buddy_allocator->allocate(4096, address, core_id);
++         if (f == static_cast<UInt64>(-1))
++            break;
++         if (inReserved(f)) { frame = f; break; }
++         m_data_pool.push_back(f);
++      }
++      if (frame == static_cast<UInt64>(-1) && !m_data_pool.empty())
++      {
++         // Reserved region exhausted: fall back to a standard frame rather than crash.
++         frame = m_data_pool.back();
++         m_data_pool.pop_back();
++         stats.pt_fallbacks++;
++      }
++   }
++   stats.pt_pool_frames = m_pt_pool.size();
++   stats.data_pool_frames = m_data_pool.size();
++   return frame;
++}
++
++/*
++ * Lab 6 Task 2.2: standard-region (data) 4KB frame allocation. Never returns a
++ * reserved-bank frame while isolation is on (those are parked for page tables).
++ */
++UInt64 PageTableAwareAllocator::allocateDataFrame(UInt64 size, UInt64 address, UInt64 core_id)
++{
++   if (!m_pt_isolation || size != 4096)
++      return buddy_allocator->allocate(size, address, core_id);
++
++   UInt64 frame = static_cast<UInt64>(-1);
++   if (!m_data_pool.empty())
++   {
++      // standard-region frames parked by allocatePTFrame() are used first (any mode)
++      frame = m_data_pool.back();
++      m_data_pool.pop_back();
++   }
++   else if (!m_isolate_data)
++   {
++      frame = buddy_allocator->allocate(size, address, core_id);   // "pt_only": data unrestricted
++   }
++   else
++   {
++      while (true)
++      {
++         UInt64 f = buddy_allocator->allocate(4096, address, core_id);
++         if (f == static_cast<UInt64>(-1))
++            break;
++         if (!inReserved(f)) { frame = f; break; }
++         m_pt_pool.push_back(f);
++      }
++   }
++   stats.pt_pool_frames = m_pt_pool.size();
++   stats.data_pool_frames = m_data_pool.size();
++   return frame;
+ }
+ 
+ PageTableAwareAllocator::~PageTableAwareAllocator()
+@@ -441,7 +563,12 @@
+    //
+    if (is_pagetable_allocation)
+    {
+-      auto page = buddy_allocator->allocate(size, address, core_id);
++      // Lab 6 Task 2.2: reserved region when isolation is on, generic buddy otherwise
++      auto page = (m_pt_isolation && m_isolate_pt) ? allocatePTFrame(address, core_id)
++                                 : buddy_allocator->allocate(size, address, core_id);
++      stats.pt_frames++;
++      if (page != static_cast<UInt64>(-1) && inReserved(page))
++         stats.pt_frames_in_pt_bank++;
+ #ifdef DEBUG_PAGE_TABLE_AWARE_ALLOCATOR
+       log_file << "Debug: Pagetable allocation, result = " << page << std::endl;
+ #endif
+@@ -508,7 +635,13 @@
+       log_file << "Debug: No 2MB allocation, falling back to buddy allocator"
+                << std::endl;
+ #endif
+-      auto page_fallback = buddy_allocator->allocate(size, address, core_id);
++      auto page_fallback = allocateDataFrame(size, address, core_id); // Lab 6 Task 2.2: standard region
++      if (page_fallback != static_cast<UInt64>(-1))
++      {
++         stats.data_frames_4k++;
++         if (inReserved(page_fallback))
++            stats.data_frames_in_pt_bank++;
++      }
+ 
+       // Buddy succeeded → 4KB allocation
+       if (page_fallback != static_cast<UInt64>(-1))
+@@ -532,7 +665,7 @@
+          if (demoted)
+          {
+             stats.four_kb_allocated++;
+-            auto page_retry = buddy_allocator->allocate(size, address, core_id);
++            auto page_retry = allocateDataFrame(size, address, core_id); // Lab 6 Task 2.2
+             return make_pair(page_retry, 12);
+          }
+          else
+--- a/common/system/memory_management/physical_memory_allocators/pagetable_aware_allocator.h
++++ b/common/system/memory_management/physical_memory_allocators/pagetable_aware_allocator.h
+@@ -30,6 +30,10 @@
+ 
+     virtual UInt64 handle_page_table_allocations(UInt64 bytes)
+     {
++        // Lab 6 Task 2.2: with isolation on, kernel-allocated page-table frames
++        // (e.g. the radix root) also come from the reserved bank.
++        if (m_pt_isolation && m_isolate_pt && bytes == 4096)
++            return allocatePTFrame(0, 0);
+         stats.kernel_pages_used += 1;
+         UInt64 temp = kernel_start_address;
+         kernel_start_address += bytes; // This function is useful mainly for the page table allocation in the HDC, HT and Elastic Cuckoo Hash Table; For Radix we can invoke the conventional allocator directly
+@@ -59,6 +63,14 @@
+         UInt64 two_mb_demoted;
+         UInt64 total_allocations;
+         UInt64 kernel_pages_used;
++        // Lab 6 Task 2.2: DRAM bank placement of 4KB frames
++        UInt64 pt_frames;               // page-table frames handed out
++        UInt64 pt_frames_in_pt_bank;    // ... that landed in the reserved bank
++        UInt64 data_frames_4k;          // 4KB data frames handed out (buddy fallback path)
++        UInt64 data_frames_in_pt_bank;  // ... that landed in the reserved bank (0 when isolated)
++        UInt64 pt_pool_frames;          // reserved-bank frames currently parked for future PTs
++        UInt64 data_pool_frames;        // standard-region frames currently parked for data
++        UInt64 pt_fallbacks;            // PT allocations that could not get a reserved-bank frame
+     } stats;
+ 
+     double (PageTableAwareAllocator::*frag_fun)();
+@@ -74,4 +86,22 @@
+     std::map<UInt64, std::tuple<UInt64, std::bitset<512>, bool>> two_mb_map; // <region_2MB, <region_begin, bitset, promoted>>
+     UInt64 m_frag_factor;
+ 
++    // Lab 6 Task 2.2: DRAM-aware page-table placement ("bank isolation").
++    // Reserved region = every 4KB frame whose DRAM bank index == m_pt_bank
++    // (i.e. that bank in every channel and rank); standard region = all others.
++    bool m_pt_isolation;
++    bool m_isolate_pt;      // PT frames come only from the reserved banks
++    bool m_isolate_data;    // data frames never come from the reserved banks
++    UInt32 m_pt_bank;       // highest reserved bank
++    UInt32 m_pt_num_banks;  // reserved banks = [m_pt_bank - m_pt_num_banks + 1, m_pt_bank]
++    UInt32 m_num_banks;
++    UInt32 m_bank_shift_pfn;            // bank bits start at PFN bit m_bank_shift_pfn
++    std::vector<UInt64> m_pt_pool;      // free reserved-bank frames (PFNs)
++    std::vector<UInt64> m_data_pool;    // free standard-region frames (PFNs)
++
++    UInt32 bankOf(UInt64 pfn) const { return (pfn >> m_bank_shift_pfn) & (m_num_banks - 1); }
++    bool inReserved(UInt64 pfn) const { UInt32 b = bankOf(pfn); return b <= m_pt_bank && b + m_pt_num_banks > m_pt_bank; }
++    UInt64 allocatePTFrame(UInt64 address, UInt64 core_id);
++    UInt64 allocateDataFrame(UInt64 size, UInt64 address, UInt64 core_id);
++
+ };
+--- a/config/physical_memory_allocators/page_table_aware.cfg
++++ b/config/physical_memory_allocators/page_table_aware.cfg
+@@ -21,3 +21,10 @@
+ # If the fragmentation is 1.0, it means that the whole memory is available for allocation of large pages.
+ # The threshold for promotion is set to 0.3, which means that if more than 30% of a 2MB-reserved page is used, 
+ # the whole area will be promoted to a 2MB page.
++
++# Lab 6 Task 2.2: DRAM-aware page-table placement (bank isolation).
++# pt_isolation = true -> page-table frames only from DRAM bank `pt_bank` (in every
++# channel/rank); data 4KB frames never from that bank. Default off (= mixed baseline).
++[perf_model/page_table_aware_allocator]
++pt_isolation = false
++pt_bank = 15            # last of 16 banks (ddr4_2400.cfg num_banks = 16)
+--- a/config/virtuoso_configs/virtuoso_llc_replacement.cfg
++++ b/config/virtuoso_configs/virtuoso_llc_replacement.cfg
+@@ -0,0 +1,22 @@
++# Lab 6 Task 1.3/1.4: TLB + LLC co-design.
++# = page-size-aware L2 TLB (virtuoso_tlb_replacement.cfg) + PTE-aware LLC replacement.
++#include ./virtuoso_configs/virtuoso_tlb_replacement.cfg
++
++## ---- PTE-aware LLC (NUCA) replacement ---- ##
++# Policy implemented in common/core/memory_subsystem/cache/cache_set_llc_template.cc,
++# Bloom filter in cache/pte_priority_hint.cc (fed by L2 TLB evictions in mmu.cc).
++[perf_model/nuca]
++replacement_policy = "llc_template"
++
++[perf_model/nuca/cache/llc_pte]
++bits = 2
++insert_data = 2         # data: identical to the baseline SRRIP LLC
++insert_pte = 1          # PTE line fetched by an ordinary walk
++insert_pte_hint = 0     # PTE line fetched by a walk whose VPN hit the Bloom filter
++pte_hit_age = 0         # PTE hit -> most protected
++max_pte_ways = 8        # of 16 ways; data always keeps >= 8 ways per set
++
++[perf_model/pte_bloom]
++bits = 65536            # per bank, 2 banks -> 16 KB
++hashes = 2
++epoch = 4096            # L2 TLB evictions per bank before rotation
+--- a/config/virtuoso_configs/virtuoso_pagetable_isolated.cfg
++++ b/config/virtuoso_configs/virtuoso_pagetable_isolated.cfg
+@@ -0,0 +1,7 @@
++# Lab 6 Task 2.2/2.3: page tables isolated in DRAM bank 15; data in banks 0-14.
++# Same system as virtuoso_pagetable_aware.cfg (4KB pages only: target_fragmentation = 0.0).
++#include ./virtuoso_configs/virtuoso_pagetable_aware.cfg
++
++[perf_model/page_table_aware_allocator]
++pt_isolation = true
++pt_bank = 15
+--- a/config/virtuoso_configs/virtuoso_tlb_replacement.cfg
++++ b/config/virtuoso_configs/virtuoso_tlb_replacement.cfg
+@@ -226,3 +226,21 @@
+ 
+ 
+ 
++
++## ---- Lab 6 Task 1.2: page-size-aware L2 TLB replacement ---- ##
++# Policy implemented in common/core/memory_subsystem/cache/cache_set_tlb_template.cc
++# (SRRIP where 2MB entries insert closer to "keep", age at 1/huge_aging_period speed,
++#  and lose protection once a set holds > max_huge_ways 2MB entries).
++[perf_model/mmu/tlb_level_2/tlb1]
++replacement_policy = "tlb_template"   # per-TLB key added in tlb.cc; default is "lru"
++
++[perf_model/mmu/tlb_level_2/tlb1/psa]
++bits = 2                # RRPV width (0 = keep ... 3 = evict)
++insert_4k = 2           # 4KB entries: SRRIP "long" insertion
++insert_2m = 0           # 2MB entries: inserted as if just re-referenced
++huge_aging_period = 2   # 2MB entries age every 2nd aging round
++max_huge_ways = 6       # of 8 ways; above this, 2MB entries are unprotected
++
++# ~50/50 mix of 4KB and 2MB pages for randacc_8gb (2048 2MB regions = 4GB of the 8GB footprint)
++[perf_model/reserve_thp_allocator]
++target_fragmentation = 0.25
+--- a/microbenchmark/microbench.cpp
++++ b/microbenchmark/microbench.cpp
+@@ -1,35 +1,89 @@
+-
+-
+-#include <iostream>
+-#include <chrono>
+-#include <vector>
+-#include <algorithm>
++// Lab 6 Task 1.1 microbenchmark: page-granular random pointer chase over > 8 GB.
++//
++// One 8-byte node per 4 KB page, all nodes linked into a single random cycle
++// (Sattolo's algorithm), so the chase visits every page once per lap in random
++// order. Each step is ONE dependent load whose address comes from the previous
++// load:   p = *p;
++// so there is no memory-level parallelism and the full translation latency
++// (TLB miss -> page walk) of every step is exposed. Consecutive steps land on
++// unrelated pages, so with a 512-entry L2 TLB (2 MB of reach with 4 KB pages,
++// 1 GB with 2 MB pages) nearly every step misses: L2 TLB MPKI >> 10.
++//
++// Within its page, each node sits at a pseudo-random cache-line offset, so the
++// nodes spread over all cache sets instead of all mapping to line 0 of a page.
++// The array is 2 MB aligned so 2 MB pages in the simulated OS align with it.
++//
++// Usage: microbench [footprint_GiB=8.5] [steps=25000000] [seed=42]
++// Only the chase loop is inside SimRoiStart()/SimRoiEnd(); the trace is recorded
++// with record-trace --roi (see record_microbench_trace.sh).
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <random>
++#include <vector>
++#include <sys/mman.h>
+ #include "sim_api.h"
+ 
++static const uint64_t PAGE = 4096;
++static const uint64_t LINE = 64;
++static const uint64_t HUGE_ALIGN = 2ull << 20;
+ 
+-void init()
++static uint8_t *g_base = nullptr;
++static uint64_t g_pages = 0;
++
++static inline uint64_t *nodeOf(uint64_t page)
+ {
+-    // Initialization code here
+-    // This could include setting up data structures, allocating memory, etc.
++    // pseudo-random line within the page (Fibonacci hashing of the page number)
++    uint64_t line = (page * 0x9E3779B97F4A7C15ull) >> 58;   // 0..63
++    return reinterpret_cast<uint64_t *>(g_base + page * PAGE + line * LINE);
+ }
+-int main(int argc, char** argv) {
+ 
+-    init(); // Call the initialization function
+-    std::cout << "Starting microbenchmark..." << std::endl;
+-    SimRoiStart();
+-    /*
+-    @kanellok: FOCA
++static void init(double gib, uint64_t seed)
++{
++    const uint64_t bytes = static_cast<uint64_t>(gib * (1ull << 30)) & ~(PAGE - 1);
++    g_pages = bytes / PAGE;
+ 
+-    Add your code here to benchmark address translation.
+-    The SimRoiStart() and SimRoiEnd() functions mark the start and end of your benchmark. 
+-    It would be good if you wrap ONLY the heavy lifting code in these functions so that 
+-    you do not consider initialization/finalization time in your benchmark.
+-    
+-    */
+-    SimRoiEnd();
++    void *raw = mmap(nullptr, bytes + HUGE_ALIGN, PROT_READ | PROT_WRITE,
++                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++    if (raw == MAP_FAILED) { perror("mmap"); exit(1); }
++    g_base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(raw) + HUGE_ALIGN - 1) & ~(HUGE_ALIGN - 1));
++
++    // Single random cycle over all pages (Sattolo): order[i] -> order[i+1] -> ... -> order[0]
++    std::vector<uint32_t> order(g_pages);
++    for (uint64_t i = 0; i < g_pages; i++) order[i] = static_cast<uint32_t>(i);
++    std::mt19937_64 rng(seed);
++    for (uint64_t i = g_pages - 1; i > 0; i--) {
++        uint64_t j = rng() % i;            // j < i  (Sattolo => one single cycle)
++        std::swap(order[i], order[j]);
++    }
++    // successor of page order[i] is order[i+1]; write in page order so the
++    // first touch of the array is sequential (fast, swap-friendly)
++    std::vector<uint32_t> next(g_pages);
++    for (uint64_t i = 0; i < g_pages; i++) next[order[i]] = order[(i + 1) % g_pages];
++    for (uint64_t p = 0; p < g_pages; p++)
++        *nodeOf(p) = reinterpret_cast<uint64_t>(nodeOf(next[p]));
+ 
+-    std::cout << "Microbenchmark completed." << std::endl;
++    fprintf(stderr, "[microbench] footprint %.2f GiB = %lu pages of 4 KB (%lu x 2 MB), base %p\n",
++            bytes / double(1ull << 30), (unsigned long)g_pages, (unsigned long)(bytes / HUGE_ALIGN), (void *)g_base);
++}
++
++int main(int argc, char **argv)
++{
++    const double gib = argc > 1 ? atof(argv[1]) : 8.5;
++    const uint64_t steps = argc > 2 ? strtoull(argv[2], nullptr, 10) : 25000000ull;
++    const uint64_t seed = argc > 3 ? strtoull(argv[3], nullptr, 10) : 42;
++
++    init(gib, seed);
++    fprintf(stderr, "[microbench] chasing %lu steps\n", (unsigned long)steps);
+ 
++    uint64_t *p = nodeOf(0);
++    SimRoiStart();
++    for (uint64_t i = 0; i < steps; i++)
++        p = reinterpret_cast<uint64_t *>(*p);        // dependent load: address = previous value
++    SimRoiEnd();
++
++    // use the result so the loop cannot be optimised away
++    printf("[microbench] done, final node %p\n", (void *)p);
+     return 0;
+-}
+\ No newline at end of file
++}
+--- a/microbenchmark/record_microbench_trace.sh
++++ b/microbenchmark/record_microbench_trace.sh
+@@ -1,27 +1,22 @@
+ #!/bin/bash
+-
+-
+-# This script runs the Sniper simulator with a specified configuration file and workload.
+-# Usage: ./run_example.sh 
+-
+-
+-# Path to your executable
+-WORKLOAD=</path/to/your/workload>  # Replace with your actual workload, e.g., 'ls', 'grep', etc.
+- 
+-
+-# FOCA Lab 4: Recording a Microbenchmark Trace
+-# ------------------------------------------------------------
+-# record-trace is a tool used to record traces of microbenchmarks.
+-# It captures the execution of a workload and generates a trace file that can be used for analysis
+-# or simulation purposes.
+-# -d: How many instructions to record
+-# -o: Output directory for the trace file
+-# --roi: Indicates that the trace should be recorded only during the region of interest (ROI)
+-# --: Indicates the end of options for record-trace, followed by the workload to be executed
+-
+-../record-trace -d 50000000 -o ./microbenchmark --roi -- $WORKLOAD 
+-
+-# This command will generate a trace file inside the `./microbenchmark` directory.
+-
+-
+-
++# Lab 6 Task 1.1: build and record the pointer-chase microbenchmark (microbench.cpp).
++#
++#   ./record_microbench_trace.sh [footprint_GiB=8.5] [steps=25000000] [record_instrs=30000000]
++#
++# Output: ../traces/pchase_<GiB>gb.sift  (used with run-sniper --traces=...)
++#
++# Notes:
++#  * The program really allocates and touches the whole footprint natively while
++#    being recorded: 8.5 GiB needs ~9 GB of free RAM (peak RSS measured 9.0 GB).
++#  * --sde-arch=tgl: Intel SDE 9.44 aborts with "Unexpected invalid CPUID leaf"
++#    under WSL2/Hyper-V unless it emulates an explicit CPU model (tgl = Tiger Lake,
++#    the host CPU of the machine this was recorded on; skl/hsw also work).
++#  * --roi: only the chase loop between SimRoiStart()/SimRoiEnd() is recorded.
++#    -d: number of instructions to record (>= 20M simulated per the handout).
++set -e
++cd "$(dirname "${BASH_SOURCE[0]}")"
++GIB=${1:-8.5}; STEPS=${2:-25000000}; INSTRS=${3:-30000000}
++make
++mkdir -p ../traces
++../record-trace --sde-arch=tgl -d "$INSTRS" -o "../traces/pchase_${GIB}gb" --roi -- ./microbench "$GIB" "$STEPS"
++ls -la "../traces/pchase_${GIB}gb.sift"

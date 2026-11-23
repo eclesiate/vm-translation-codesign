@@ -1,0 +1,10 @@
+# Task 2.3 ablation: which part of isolation costs IPC? (3 reps)
+f23_ptonly_r1 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=pt_only
+f23_dataonly_r1 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=data_only
+f23_iso2banks_r1 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_num_banks=2
+f23_ptonly_r2 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=pt_only
+f23_dataonly_r2 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=data_only
+f23_iso2banks_r2 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_num_banks=2
+f23_ptonly_r3 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=pt_only
+f23_dataonly_r3 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=data_only
+f23_iso2banks_r3 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000 -g --perf_model/page_table_aware_allocator/pt_num_banks=2

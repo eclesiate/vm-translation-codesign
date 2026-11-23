@@ -1,0 +1,4 @@
+abl_smoke_full config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 2500000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=full
+abl_smoke_pt_only config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 2500000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=pt_only
+abl_smoke_data_only config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 2500000 -g --perf_model/page_table_aware_allocator/pt_isolation_mode=data_only
+abl_smoke_2banks config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 2500000 -g --perf_model/page_table_aware_allocator/pt_num_banks=2

@@ -1,0 +1,25 @@
+# Lab 6 final campaign: Task 2.3 then Task 1.4, 3 repetitions each
+f23_mixed_r1 config/virtuoso_configs/virtuoso_pagetable_aware.cfg 20000000
+f23_isolated_r1 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000
+f23_mixed_r2 config/virtuoso_configs/virtuoso_pagetable_aware.cfg 20000000
+f23_isolated_r2 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000
+f23_mixed_r3 config/virtuoso_configs/virtuoso_pagetable_aware.cfg 20000000
+f23_isolated_r3 config/virtuoso_configs/virtuoso_pagetable_isolated.cfg 20000000
+f14_base_r1 config/virtuoso_configs/virtuoso_reservethp.cfg 20000000 -g --perf_model/reserve_thp_allocator/target_fragmentation=0.25
+f14_tlb_r1 config/virtuoso_configs/virtuoso_tlb_replacement.cfg 20000000
+f14_llc_bloom_r1 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru
+f14_llc_type_r1 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru -g --perf_model/nuca/cache/llc_pte/insert_pte=0
+f14_comb_r1 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000
+f14_comb_type_r1 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/nuca/cache/llc_pte/insert_pte=0
+f14_base_r2 config/virtuoso_configs/virtuoso_reservethp.cfg 20000000 -g --perf_model/reserve_thp_allocator/target_fragmentation=0.25
+f14_tlb_r2 config/virtuoso_configs/virtuoso_tlb_replacement.cfg 20000000
+f14_llc_bloom_r2 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru
+f14_llc_type_r2 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru -g --perf_model/nuca/cache/llc_pte/insert_pte=0
+f14_comb_r2 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000
+f14_comb_type_r2 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/nuca/cache/llc_pte/insert_pte=0
+f14_base_r3 config/virtuoso_configs/virtuoso_reservethp.cfg 20000000 -g --perf_model/reserve_thp_allocator/target_fragmentation=0.25
+f14_tlb_r3 config/virtuoso_configs/virtuoso_tlb_replacement.cfg 20000000
+f14_llc_bloom_r3 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru
+f14_llc_type_r3 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/mmu/tlb_level_2/tlb1/replacement_policy=lru -g --perf_model/nuca/cache/llc_pte/insert_pte=0
+f14_comb_r3 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000
+f14_comb_type_r3 config/virtuoso_configs/virtuoso_llc_replacement.cfg 20000000 -g --perf_model/nuca/cache/llc_pte/insert_pte=0
